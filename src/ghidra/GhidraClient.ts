@@ -115,6 +115,7 @@ export class GhidraClient {
   #lastDiagnostics: Readonly<Record<string, JsonValue>> = {};
   #startupController: AbortController | undefined;
   #startPromise: Promise<GhidraStartResult> | undefined;
+  #ready = false;
   #closePromise: Promise<void> | undefined;
   readonly #failure = bindGhidraSessionFailure(
     () => this.#diagnostics(),
@@ -216,7 +217,8 @@ export class GhidraClient {
     void started.then(
       (result) => {
         signal?.removeEventListener("abort", onAbort);
-        if (!result.ok) reset();
+        if (result.ok) this.#ready = true;
+        else reset();
       },
       (cause: unknown) => {
         this.#logger.debug(
@@ -286,6 +288,20 @@ export class GhidraClient {
   ): Promise<Result<JsonValue, GhidraSessionError>> {
     const started = await this.start(options.signal, options.progress);
     if (!started.ok) return started;
+    return this.#requestQueue.run(
+      operation,
+      parameters,
+      options.signal === undefined ? {} : { signal: options.signal },
+    );
+  }
+
+  /** Dispatch against the connected bridge without invoking startup or retry. */
+  callToolIfReady(
+    operation: GhidraOperation,
+    parameters: Readonly<Record<string, JsonValue>>,
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<Result<JsonValue, GhidraSessionError> | undefined> {
+    if (!this.isReady()) return Promise.resolve(undefined);
     return this.#requestQueue.run(
       operation,
       parameters,
@@ -416,6 +432,16 @@ export class GhidraClient {
     }
   }
 
+  /** True only after the authenticated startup handshake has completed. */
+  isReady(): boolean {
+    return (
+      this.#ready &&
+      this.#socket !== undefined &&
+      !this.#socket.destroyed &&
+      this.#closePromise === undefined
+    );
+  }
+
   #cleanupError(cause: unknown): AnalysisError {
     if (cause instanceof AnalysisError && cause.cleanupIncomplete) return cause;
     return new ProviderCleanupError(
@@ -462,6 +488,7 @@ export class GhidraClient {
   }
 
   #requestClose(forceStop: boolean): Promise<void> {
+    this.#ready = false;
     const starting = this.#startPromise;
     const controller = this.#startupController;
     controller?.abort();

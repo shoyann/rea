@@ -255,6 +255,10 @@ npx rea-agents@latest setup
 
 REA برای پژوهش، آموزش، تعامل‌پذیری، حفظ نرم‌افزار و تحلیل نرم‌افزارهایی است که مالک آن‌ها هستید یا اجازهٔ بررسی آن‌ها را دارید، در چارچوب قانون.
 
+The project's position on illegal or unauthorized use covers all REA
+versions, distribution channels, and platforms; each copy retains its
+applicable licenses.
+
 ## مشارکت
 
 از کمک شما به REA استقبال می‌کنیم! برای گزارش خطا یا پیشنهاد قابلیت، یک [issue باز کنید](https://github.com/morluto/rea/issues) یا برای بهبود کد و مستندات [pull request بفرستید](https://github.com/morluto/rea/pulls).
@@ -264,5 +268,17 @@ REA برای پژوهش، آموزش، تعامل‌پذیری، حفظ نرم�
 ## مجوز
 
 [MIT](LICENSE)
+
+REA-authored code is licensed under MIT. Third-party material retains its own
+licenses and copyright notices; see [Third-party notices](THIRD_PARTY_NOTICES.md)
+for the dependency inventory, preserved license texts, and external-tool terms.
+
+**You must legally obtain and be authorized to use commercial tools**, including
+IDA Pro / Hex-Rays decompilers, Hopper, and JEB, under their applicable licenses.
+REA grants no tool license, key, or activation entitlement. Trials and demos
+remain subject to vendor terms, including user, feature, automation, and output
+sharing restrictions. Cracked copies, stolen keys, unauthorized key sharing,
+and bypassing license restrictions are not authorized. This guidance does not
+amend MIT or third-party licenses.
 
 </div>

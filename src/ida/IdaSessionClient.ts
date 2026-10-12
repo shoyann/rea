@@ -1,5 +1,9 @@
 import { z } from "zod";
 import {
+  ABORTED,
+  waitForAbortable,
+} from "../application/binary/AbortablePromise.js";
+import {
   createAnalysisExecution,
   type AnalysisClient,
   type AnalysisOperation,
@@ -141,10 +145,35 @@ export class IdaSessionClient implements AnalysisClient {
     return call;
   }
 
+  async executeIfReady(
+    operation: AnalysisOperation,
+    parameters: Readonly<Record<string, JsonValue>>,
+    options?: ExecutionOptions,
+  ) {
+    if (!this.#openCompleted || this.#closed || this.#closing)
+      return Promise.resolve(undefined);
+    const call = this.#tail.then(() => {
+      if (!this.#openCompleted || this.#closed || this.#closing)
+        return undefined;
+      if (wasCancelled(options))
+        return err(new AnalysisCancelledError(operation));
+      return this.#execute(operation, parameters, options, true);
+    });
+    this.#tail = call.then(
+      () => undefined,
+      () => undefined,
+    );
+    const result = await waitForAbortable(call, options?.signal);
+    return result === ABORTED
+      ? err(new AnalysisCancelledError(operation))
+      : result;
+  }
+
   async #execute(
     operation: AnalysisOperation,
     parameters: Readonly<Record<string, JsonValue>>,
     options?: ExecutionOptions,
+    readyOnly = false,
   ) {
     if (this.#closed || this.#closing)
       return err(
@@ -202,7 +231,7 @@ export class IdaSessionClient implements AnalysisClient {
       parameters,
     };
     try {
-      await this.#start();
+      if (!readyOnly) await this.#start();
       const before = await this.#observe(options);
       failureContext.metadataBefore = before;
       if (wasCancelled(options)) throw new AnalysisCancelledError(operation);

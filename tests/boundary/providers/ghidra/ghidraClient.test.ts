@@ -150,6 +150,26 @@ afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close()));
 });
 
+describe("GhidraClient ready-only dispatch", () => {
+  it("does not start cold and preserves the normal result once ready", async () => {
+    const launcher = new FixtureLauncher();
+    const client = clientFor(launcher);
+
+    await expect(client.callToolIfReady("list_strings", {})).resolves.toBe(
+      undefined,
+    );
+    expect(launcher.processes).toEqual([]);
+
+    const started = await client.start();
+    if (!started.ok) throw started.error;
+    await expect(client.callToolIfReady("list_strings", {})).resolves.toEqual({
+      ok: true,
+      value: [expect.objectContaining({ value: "fixture value" })],
+    });
+    expect(launcher.processes).toHaveLength(1);
+  });
+});
+
 it("reports unknown startup work and stops notifications when cancellation releases the process", async () => {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   const launcher = new FixtureLauncher("silent");

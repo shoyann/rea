@@ -81,7 +81,9 @@ export class BinarySession
     | undefined;
   #transition: Promise<void> = Promise.resolve();
   #transitionGeneration = 0;
+  #transitionPending = 0;
   readonly #calls = new Map<Promise<unknown>, number>();
+  readonly #promptCompletionControllers = new Set<AbortController>();
   readonly #providerRouter: SessionProviderRouter;
   readonly #runtimeUnavailability = new Map<
     string,
@@ -532,6 +534,38 @@ export class BinarySession
     return call.finally(() => this.#calls.delete(call));
   }
 
+  /** Run a prompt lookup only against an already connected provider child. */
+  executeIfProviderReady(
+    name: Parameters<AnalysisOperationPort["execute"]>[0],
+    arguments_: Readonly<Record<string, JsonValue>>,
+    options?: Pick<ExecutionOptions, "signal" | "selectorOrigin">,
+  ): Promise<Result<AnalysisExecution, AnalysisError> | undefined> {
+    const active = this.#active;
+    if (
+      this.#transitionPending > 0 ||
+      active === undefined ||
+      active.client.executeIfReady === undefined
+    )
+      return Promise.resolve(undefined);
+
+    const controller = new AbortController();
+    this.#promptCompletionControllers.add(controller);
+    const signal =
+      options?.signal === undefined
+        ? controller.signal
+        : AbortSignal.any([controller.signal, options.signal]);
+    const generation = this.#transitionGeneration;
+    const call = active.client.executeIfReady(name, arguments_, {
+      ...options,
+      signal,
+    });
+    this.#calls.set(call, generation);
+    return call.finally(() => {
+      this.#calls.delete(call);
+      this.#promptCompletionControllers.delete(controller);
+    });
+  }
+
   /** Admit one composed request until its result and session bookkeeping settle. */
   withAdmittedAnalysis<Value>(
     operationName: string,
@@ -728,6 +762,9 @@ export class BinarySession
   #serialize<T>(
     operation: (admittedThrough: number) => Promise<T>,
   ): Promise<T> {
+    for (const controller of this.#promptCompletionControllers)
+      controller.abort();
+    this.#transitionPending += 1;
     // Later calls wait for this transition and must not be included in its drain.
     const admittedThrough = this.#transitionGeneration++;
     const result = this.#transition.then(
@@ -737,6 +774,14 @@ export class BinarySession
     this.#transition = result.then(
       () => undefined,
       () => undefined,
+    );
+    void result.then(
+      () => {
+        this.#transitionPending -= 1;
+      },
+      () => {
+        this.#transitionPending -= 1;
+      },
     );
     return result;
   }

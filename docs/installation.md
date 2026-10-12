@@ -785,7 +785,7 @@ Ghidra's default analysis settings, and loads its packaged Java
 bridge via `-scriptPath`; it never opens an existing user project. Linux and
 macOS use a current-user-only local bridge socket and descriptor. The
 project remains under the selected temporary directory. If its Unix socket
-pathname would exceed the host's byte limit, REA allocates a separate mode-0700
+pathname would exceed the host's byte limit, REA allocates a separate owner-only
 socket directory under `/tmp` and removes it on close, cancellation, or failure.
 Diagnostics retain the actual endpoint and both owned directories.
 On Linux and macOS, REA starts the inspected JVM directly using Ghidra's own LaunchSupport

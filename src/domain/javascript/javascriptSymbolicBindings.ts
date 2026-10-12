@@ -55,6 +55,7 @@ interface OriginPropertyWrite {
   readonly value: SymbolicValue;
   readonly definite: boolean;
   readonly dispatchTarget?: SymbolicValue | undefined;
+  readonly activation?: OriginActivation | undefined;
 }
 interface OriginAttributes {
   readonly configurable?: boolean | undefined;
@@ -97,6 +98,15 @@ interface OriginReceiverWrite {
   readonly receiver: t.Node;
   readonly write: PropertyWrite;
 }
+type OriginEvent =
+  | OriginReceiverWrite
+  | t.CallExpression
+  | t.OptionalCallExpression;
+interface OriginActivation {
+  readonly point: t.Node;
+  readonly definite: boolean;
+  readonly parent?: OriginActivation | undefined;
+}
 interface SymbolicReturnFlow {
   readonly values: readonly SymbolicValue[];
   readonly fallsThrough: boolean;
@@ -114,7 +124,19 @@ export class JavaScriptSymbolicBindings {
     string,
     Map<number, Map<string | null, PropertyWrite[]>>
   >();
-  readonly #receiverWrites: OriginReceiverWrite[] = [];
+  readonly #originEvents = new Map<t.Node, OriginEvent[]>();
+  readonly #originActivated = new WeakMap<
+    ReadonlyMap<string, SymbolicValue>,
+    Set<t.Node>
+  >();
+  readonly #originActivations = new WeakMap<
+    ReadonlyMap<string, SymbolicValue>,
+    OriginActivation
+  >();
+  readonly #originCalls = new WeakMap<
+    ReadonlyMap<string, SymbolicValue>,
+    WeakMap<t.Node, SymbolicValue>
+  >();
   readonly #objectWrites = new WeakMap<
     OriginReference[],
     Map<string | null, OriginPropertyWrite[]>
@@ -177,6 +199,8 @@ export class JavaScriptSymbolicBindings {
     });
     traverseJavaScriptAst(program, {
       enter: (node) => {
+        if (t.isCallExpression(node) || t.isOptionalCallExpression(node))
+          this.#retainOriginEvent(node, node);
         if (t.isAssignmentExpression(node))
           this.#indexWrite(node.left, node.right, node);
         if (t.isUpdateExpression(node))
@@ -200,7 +224,7 @@ export class JavaScriptSymbolicBindings {
           mutation,
         );
       else
-        this.#receiverWrites.push({
+        this.#retainOriginEvent(mutation.site, {
           receiver: mutation.target,
           write: {
             path: mutation.path,
@@ -215,13 +239,17 @@ export class JavaScriptSymbolicBindings {
     const unresolved = this.unresolved;
     this.#originCache = new WeakMap();
     try {
-      this.#indexReceiverWrites();
+      this.#indexReceiverWrites(program, emptyEnvironment);
       completeSemanticSteps(
-        electronIdentity.enrichWritesSteps((target) =>
-          this.#atOriginPoint(target, () =>
+        electronIdentity.enrichWritesSteps((target) => {
+          const owner = this.#functionOwner(target);
+          const environment = this.environmentAt(target);
+          if (owner && environment.scopeNode === owner)
+            this.#indexReceiverWrites(owner, environment);
+          return this.#atOriginPoint(target, () =>
             this.#symbolicElectronWritePaths(target),
-          ),
-        ),
+          );
+        }),
       );
       if (this.truncated) electronIdentity.invalidateAll();
     } finally {
@@ -818,6 +846,30 @@ export class JavaScriptSymbolicBindings {
     node: t.CallExpression | t.OptionalCallExpression,
     env: SymbolicEnvironment,
   ): SymbolicValue {
+    if (this.#originCache === undefined) return this.#callValue(node, env);
+    let cache = this.#originCalls.get(env.values);
+    if (!cache) {
+      cache = new WeakMap();
+      this.#originCalls.set(env.values, cache);
+    }
+    const found = cache.get(node);
+    if (found) return found;
+    cache.set(node, symbolicUnknown("recursive origin call"));
+    const value = this.#callValue(node, env);
+    cache.set(node, value);
+    return value;
+  }
+
+  #callValue(
+    node: t.CallExpression | t.OptionalCallExpression,
+    env: SymbolicEnvironment,
+  ): SymbolicValue {
+    const invocation =
+      this.#originCache === undefined
+        ? undefined
+        : this.#originWrite({ site: node, value: node, path: [] }, env);
+    if (this.#originCache !== undefined && !invocation)
+      return symbolicUnknown("unreached origin invocation");
     const mutations = this.#intrinsicCalls.get(node);
     if (this.#originCache !== undefined && mutations?.[0]?.returnsTarget) {
       const target = mutations[0].target;
@@ -839,7 +891,8 @@ export class JavaScriptSymbolicBindings {
             },
             env,
           ),
-        );
+        )
+        .filter((write) => write !== undefined);
       return {
         ...value,
         [originSnapshot]: { base: value, writes },
@@ -859,6 +912,14 @@ export class JavaScriptSymbolicBindings {
               : symbolicUnknown("dynamic module");
           if (loaded.kind === "namespace") {
             const factory = this.#namespaceOwners.get(loaded.bindingId);
+            if (factory && this.#originCache !== undefined) {
+              this.#originActivations.set(loaded.environment.values, {
+                point: node,
+                parent: this.#originActivations.get(env.values),
+                definite: invocation!.definite,
+              });
+              this.#indexReceiverWrites(factory, loaded.environment);
+            }
             result =
               factory === undefined
                 ? loaded
@@ -888,6 +949,15 @@ export class JavaScriptSymbolicBindings {
           this.#activeFunctions.add(value.node);
           try {
             const bound = this.bind(value, args, node);
+            if (this.#originCache !== undefined) {
+              const outer = this.#originActivations.get(env.values);
+              this.#originActivations.set(bound.values, {
+                point: node,
+                parent: outer,
+                definite: invocation!.definite,
+              });
+              this.#indexReceiverWrites(value.node, bound);
+            }
             const returned = t.isBlockStatement(value.node.body)
               ? this.#returns(value.node.body.body, bound)
               : this.evaluate(value.node.body, bound);
@@ -955,6 +1025,12 @@ export class JavaScriptSymbolicBindings {
           fallsThrough: false,
         };
       }
+      if (this.#originCache !== undefined)
+        this.#executeOriginEvents(
+          statement,
+          env,
+          !unresolvedFallthrough && continuationConditions.length === 0,
+        );
       if (t.isThrowStatement(statement))
         return {
           values: [...possible, symbolicUnknown("wrapper exits by throwing")],
@@ -1049,6 +1125,7 @@ export class JavaScriptSymbolicBindings {
       const values = new Map<string, SymbolicValue>();
       const environment: SymbolicEnvironment = {
         values,
+        parent: this.environmentAt(call),
         point: factory.body,
         scopeNode: factory,
         ...(this.state.scopeByNode.get(factory)?.scopeId === undefined
@@ -1308,22 +1385,36 @@ export class JavaScriptSymbolicBindings {
           ? [...(indexed?.values() ?? [])].flat()
           : [...(indexed?.get(key) ?? []), ...(indexed?.get(null) ?? [])];
       for (const write of owned) {
-        if ((write.source.site.end ?? Infinity) > (boundary ?? -Infinity))
-          continue;
+        let commit = write.source.site;
+        for (
+          let activation = write.activation;
+          activation;
+          activation = activation.parent
+        ) {
+          if (
+            resolver.#functionOwner(point ?? commit) ===
+            resolver.#functionOwner(commit)
+          )
+            break;
+          commit = activation.point;
+        }
+        if ((commit.end ?? Infinity) > (boundary ?? -Infinity)) continue;
         if (--resolver.#remainingEvaluations < 0) {
           resolver.truncated = true;
           break;
         }
         merged.push(write);
       }
-      const seen = new Set<PropertyWrite>();
+      const seen = new Map<PropertyWrite, Set<OriginActivation | undefined>>();
       return merged
-        .filter(({ source }) => !seen.has(source) && Boolean(seen.add(source)))
-        .sort(
-          (left, right) =>
-            (left.source.site.end ?? 0) - (right.source.site.end ?? 0) ||
-            (right.source.site.start ?? 0) - (left.source.site.start ?? 0),
-        );
+        .filter((write) => {
+          const activations = seen.get(write.source) ?? new Set();
+          if (activations.has(write.activation)) return false;
+          activations.add(write.activation);
+          seen.set(write.source, activations);
+          return true;
+        })
+        .sort((left, right) => resolver.#compareOriginWrites(left, right));
     };
     return {
       ...value,
@@ -1336,6 +1427,35 @@ export class JavaScriptSymbolicBindings {
         },
       },
     } as OriginValue;
+  }
+
+  #compareOriginWrites(
+    left: OriginPropertyWrite,
+    right: OriginPropertyWrite,
+  ): number {
+    const path = (write: OriginPropertyWrite): t.Node[] => {
+      const nodes = [write.source.site];
+      for (
+        let activation = write.activation;
+        activation;
+        activation = activation.parent
+      )
+        nodes.unshift(activation.point);
+      return nodes;
+    };
+    const before = path(left),
+      after = path(right);
+    for (
+      let index = 0;
+      index < Math.min(before.length, after.length);
+      index += 1
+    ) {
+      const order =
+        (before[index]!.end ?? 0) - (after[index]!.end ?? 0) ||
+        (after[index]!.start ?? 0) - (before[index]!.start ?? 0);
+      if (order !== 0) return order;
+    }
+    return before.length - after.length;
   }
 
   #originWrites(
@@ -1389,7 +1509,8 @@ export class JavaScriptSymbolicBindings {
           this.truncated = true;
           break;
         }
-        writes.push(this.#originWrite(write, environment));
+        const effect = this.#originWrite(write, environment);
+        if (effect) writes.push(effect);
       }
     }
     return writes;
@@ -1398,22 +1519,50 @@ export class JavaScriptSymbolicBindings {
   #originWrite(
     write: PropertyWrite,
     environment: SymbolicEnvironment,
-  ): OriginPropertyWrite {
-    let definite = write.mutation?.definite ?? true;
+  ): OriginPropertyWrite | undefined {
+    let definite =
+      (write.mutation?.definite ?? true) &&
+      this.#originActivations.get(environment.values)?.definite !== false;
+    let child = write.site;
     for (
       let parent = this.state.parentsByNode.get(write.site);
       parent && parent !== this.#functionOwner(write.site);
-      parent = this.state.parentsByNode.get(parent)
+      child = parent, parent = this.state.parentsByNode.get(parent)
     ) {
+      let applicable: boolean | undefined = true;
       if (
-        t.isIfStatement(parent) ||
-        t.isConditionalExpression(parent) ||
-        t.isLogicalExpression(parent) ||
+        (t.isIfStatement(parent) || t.isConditionalExpression(parent)) &&
+        child !== parent.test
+      ) {
+        const truth = this.#atOriginPoint(
+          parent.test,
+          () => symbolicTruth(this.evaluate(parent.test, environment)),
+          true,
+        );
+        applicable =
+          truth === undefined
+            ? undefined
+            : child === parent.consequent
+              ? truth
+              : !truth;
+      } else if (t.isLogicalExpression(parent) && child === parent.right) {
+        applicable = this.#atOriginPoint(
+          parent.left,
+          () =>
+            symbolicLogicalRight(
+              parent.operator,
+              this.evaluate(parent.left, environment),
+            ),
+          true,
+        );
+      } else if (
         t.isLoop(parent) ||
         t.isSwitchCase(parent) ||
         t.isTryStatement(parent)
       )
-        definite = false;
+        applicable = undefined;
+      if (applicable === false) return undefined;
+      if (applicable === undefined) definite = false;
     }
     const assignment = t.isAssignmentExpression(write.site);
     const logical =
@@ -1444,6 +1593,7 @@ export class JavaScriptSymbolicBindings {
       source: write,
       path: write.path,
       definite,
+      activation: this.#originActivations.get(environment.values),
       get dispatchTarget(): SymbolicValue | undefined {
         return readDispatch();
       },
@@ -1805,12 +1955,75 @@ export class JavaScriptSymbolicBindings {
     return absent ? true : attributes?.writable;
   }
 
+  #originDescriptorValidity(
+    descriptor: SymbolicValue,
+    active: Set<SymbolicValue>,
+  ): boolean | undefined {
+    if (descriptor.kind === "union") {
+      const variants = descriptor.values.map((value) =>
+        this.#originDescriptorValidity(value, active),
+      );
+      return variants.length > 0 &&
+        variants.every((value) => value === variants[0])
+        ? variants[0]
+        : undefined;
+    }
+    if (descriptor.kind === "literal") return false;
+    if (descriptor.kind === "unknown" || descriptor.kind === "external")
+      return undefined;
+    const fields = new Map(
+      ["value", "writable", "get", "set"].map(
+        (name) =>
+          [
+            name,
+            this.#originProperties(descriptor, name, new Set(), active),
+          ] as const,
+      ),
+    );
+    const definite = (name: string): boolean =>
+      fields.get(name)!.definiteKeys.has(name);
+    const possible = (name: string): boolean =>
+      fields.get(name)!.values.length > 0;
+    const data = ["value", "writable"],
+      accessor = ["get", "set"];
+    if (data.some(definite) && accessor.some(definite)) return false;
+    let valid: boolean | undefined =
+      data.some(possible) && accessor.some(possible) ? undefined : true;
+    if (
+      [...fields].some(
+        ([name, field]) =>
+          !definite(name) && !possible(name) && field.complete !== true,
+      )
+    )
+      valid = undefined;
+    for (const name of accessor) {
+      const choices = fields
+        .get(name)!
+        .values.flatMap(symbolicVariants)
+        .map((value) =>
+          value.kind === "function" ||
+          (value.kind === "literal" && value.value === undefined)
+            ? true
+            : value.kind === "unknown" || value.kind === "external"
+              ? undefined
+              : false,
+        );
+      if (choices.length === 0) continue;
+      if (choices.every((choice) => choice === false) && definite(name))
+        return false;
+      if (!choices.every((choice) => choice === true)) valid = undefined;
+    }
+    return valid;
+  }
+
   #originDescriptorSuccess(
     descriptor: SymbolicValue,
     prior: OriginProperties,
     key: string | null,
     active: Set<SymbolicValue>,
   ): boolean | undefined {
+    const validity = this.#originDescriptorValidity(descriptor, active);
+    if (validity !== true) return validity;
     const attributes = key === null ? undefined : prior.attributes?.get(key);
     if (
       attributes?.configurable === true ||
@@ -2065,6 +2278,26 @@ export class JavaScriptSymbolicBindings {
     const names = [...(source.orderedKeys ?? source.definiteKeys)];
     if (key !== null && !names.includes(key)) names.push(key);
     let continuation = source.orderedKeys !== undefined;
+    if (mutation.operation === "descriptors") {
+      for (const name of names) {
+        const selected = this.#originEnumerableProperties(
+          write.value,
+          name,
+          new Set(),
+          active,
+        );
+        if (selected.values.length === 0) continue;
+        const valid = this.#originDescriptorValidity(
+          symbolicUnion(selected.values),
+          active,
+        );
+        if (valid === false && selected.definiteKeys.has(name)) {
+          interrupted.add(mutation.site);
+          return { values, definiteKeys, attributes, interrupted };
+        }
+        if (valid !== true) continuation = false;
+      }
+    }
     for (const name of names) {
       if (--this.#remainingEvaluations < 0) {
         this.truncated = true;
@@ -2202,17 +2435,15 @@ export class JavaScriptSymbolicBindings {
                 if (selected === key) return writes.slice(0, end - 1);
                 const candidates = snapshot.selectWrites!(selected);
                 const index = candidates.findIndex(
-                  (candidate) => candidate.source === write!.source,
+                  (candidate) =>
+                    candidate.source === write!.source &&
+                    candidate.activation === write!.activation,
                 );
                 return index >= 0
                   ? candidates.slice(0, index)
                   : candidates.filter(
                       (candidate) =>
-                        (candidate.source.site.end ?? 0) <
-                          (write!.source.site.end ?? 0) ||
-                        (candidate.source.site.end === write!.source.site.end &&
-                          (candidate.source.site.start ?? 0) >
-                            (write!.source.site.start ?? 0)),
+                        this.#compareOriginWrites(candidate, write!) < 0,
                     );
               },
             }),
@@ -2470,7 +2701,7 @@ export class JavaScriptSymbolicBindings {
     else {
       const leaf = unwrapJavaScriptExpression(target).node;
       if (t.isMemberExpression(leaf) || t.isOptionalMemberExpression(leaf))
-        this.#receiverWrites.push({
+        this.#retainOriginEvent(site, {
           receiver: leaf.object,
           write: {
             path: [path.at(-1) ?? null],
@@ -2481,22 +2712,88 @@ export class JavaScriptSymbolicBindings {
     }
   }
 
-  #indexReceiverWrites(): void {
-    const pending = [...this.#receiverWrites].sort(
-      (left, right) => (left.receiver.end ?? 0) - (right.receiver.end ?? 0),
+  #retainOriginEvent(site: t.Node, event: OriginEvent): void {
+    let statement = site;
+    while (!t.isStatement(statement) && !t.isFunction(statement)) {
+      const parent = this.state.parentsByNode.get(statement);
+      if (!parent) break;
+      statement = parent;
+    }
+    // The return-flow owner interprets blocks and branches. Other control
+    // containers retain their nested events as possible execution at that
+    // statement, without claiming a path through an unsupported construct.
+    for (
+      let parent = this.state.parentsByNode.get(statement);
+      parent && !t.isFunction(parent) && !t.isProgram(parent);
+      parent = this.state.parentsByNode.get(parent)
+    ) {
+      if (
+        t.isTryStatement(parent) ||
+        t.isLoop(parent) ||
+        t.isSwitchStatement(parent)
+      )
+        statement = parent;
+    }
+    const events = this.#originEvents.get(statement) ?? [];
+    events.push(event);
+    this.#originEvents.set(statement, events);
+  }
+
+  #indexReceiverWrites(owner: t.Node, environment: SymbolicEnvironment): void {
+    if (
+      !t.isProgram(owner) &&
+      !(t.isFunction(owner) && t.isBlockStatement(owner.body))
+    ) {
+      this.#executeOriginEvents(owner, environment);
+      return;
+    }
+    const activated =
+      this.#originActivated.get(environment.values) ?? new Set();
+    if (activated.has(owner)) return;
+    activated.add(owner);
+    this.#originActivated.set(environment.values, activated);
+    if (t.isProgram(owner)) this.#returnFlow(owner.body, environment);
+    else if (t.isFunction(owner) && t.isBlockStatement(owner.body))
+      this.#returnFlow(owner.body.body, environment);
+  }
+
+  #executeOriginEvents(
+    statement: t.Node,
+    environment: SymbolicEnvironment,
+    definite = true,
+  ): void {
+    const activated =
+      this.#originActivated.get(environment.values) ?? new Set();
+    if (activated.has(statement)) return;
+    activated.add(statement);
+    this.#originActivated.set(environment.values, activated);
+    const point = (event: OriginEvent): t.Node =>
+      "receiver" in event ? event.receiver : event;
+    const pending = [...(this.#originEvents.get(statement) ?? [])].sort(
+      (left, right) => (point(left).end ?? 0) - (point(right).end ?? 0),
     );
-    for (const { receiver, write } of pending) {
-      if (!t.isProgram(this.#functionOwner(write.site))) continue;
+    for (const event of pending) {
       if (--this.#remainingEvaluations < 0) {
         this.truncated = true;
         break;
       }
+      if (!("receiver" in event)) {
+        this.#atOriginPoint(
+          event,
+          () => this.evaluate(event, environment),
+          true,
+        );
+        continue;
+      }
+      const { receiver, write } = event;
+      const effect = this.#originWrite(write, environment);
+      if (!effect) continue;
       this.#atOriginPoint(
         receiver,
         () => {
-          const environment = this.environmentAt(receiver);
-          const value = this.evaluate(receiver, environment);
-          const variants = symbolicVariants(value);
+          const variants = symbolicVariants(
+            this.evaluate(receiver, environment),
+          );
           for (const object of variants) {
             if (
               object.kind !== "object" &&
@@ -2508,10 +2805,9 @@ export class JavaScriptSymbolicBindings {
             const index = this.#objectWrites.get(references) ?? new Map();
             const key = write.path[0] ?? null;
             const writes = index.get(key) ?? [];
-            const effect = this.#originWrite(write, environment);
             writes.push({
               ...effect,
-              definite: effect.definite && variants.length === 1,
+              definite: definite && effect.definite && variants.length === 1,
             });
             index.set(key, writes);
             this.#objectWrites.set(references, index);

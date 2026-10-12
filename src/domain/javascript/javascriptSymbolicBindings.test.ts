@@ -409,6 +409,16 @@ it.each([
     `const replacement = { value: "spread" }; const object = { value: "first", ...replacement }; inspect(object.value);`,
     { kind: "literal", value: "spread" },
   ],
+  [
+    "a computed static key overrides an earlier value",
+    `const object = { value: "first", ["value"]: "last" }; inspect(object.value);`,
+    { kind: "literal", value: "last" },
+  ],
+  [
+    "a later static key overrides a known spread",
+    `const replacement = { value: "spread" }; const object = { ...replacement, value: "last" }; inspect(object.value);`,
+    { kind: "literal", value: "last" },
+  ],
 ] as const)("resolves object properties when %s", (_case, source, expected) => {
   expect(inspectOne(source)).toEqual(expected);
 });
@@ -437,4 +447,177 @@ it("propagates branch guards through object properties and function calls", () =
       false,
     ]);
   }
+});
+
+it("resolves indexed properties in each closure's own environment", () => {
+  const values = inspectedValues(`
+    const make = value => ({ value });
+    inspect(make(8).value);
+    inspect(make(9).value);
+  `);
+  expect(values).toEqual([
+    { kind: "literal", value: 8 },
+    { kind: "literal", value: 9 },
+  ]);
+});
+
+it.each([
+  ["computed data property", "{[slot]:e.ipcMain}", "[slot]"],
+  ["computed data property selected statically", "{[slot]:e.ipcMain}", ".ipc"],
+  ["computed property copied by a spread", "{...{[slot]:e.ipcMain}}", "[slot]"],
+  ["possible overwrite by a computed key", "{ipc:e.ipcMain,[slot]:{}}", ".ipc"],
+  [
+    "possible overwrite by an opaque spread",
+    "{ipc:e.ipcMain,...unknown}",
+    ".ipc",
+  ],
+])(
+  "retains possible mutation origins from %s",
+  (_name, container, selection) => {
+    const values = inspectedValues(`
+    const e=require("electron");
+    const slot=process.platform;
+    const box=${container};
+    delete box${selection}.on;
+    inspect(e.ipcMain.on);
+    inspect(e.ipcMain.handle);
+  `);
+    expect(values).toEqual([
+      expect.objectContaining({ kind: "unknown" }),
+      { kind: "external", path: ["electron", "ipcMain", "handle"] },
+    ]);
+  },
+);
+
+it.each([
+  ["duplicate own key", "{ipc:e.ipcMain,ipc:{}}", "[slot]"],
+  [
+    "accessor replacing an own key",
+    "{ipc:e.ipcMain,get ipc(){return {};}}",
+    "[slot]",
+  ],
+  ["definite spread overwrite", "{ipc:e.ipcMain,...{ipc:{}}}", "[slot]"],
+  [
+    "own key replacing a computed spread property",
+    "{...{[slot]:e.ipcMain},ipc:{}}",
+    ".ipc",
+  ],
+])(
+  "does not restore overwritten mutation origins from %s",
+  (_name, container, selection) => {
+    const values = inspectedValues(`
+    const e=require("electron");
+    const slot=process.platform;
+    const box=${container};
+    delete box${selection}.on;
+    inspect(e.ipcMain.on);
+  `);
+    expect(values).toEqual([
+      { kind: "external", path: ["electron", "ipcMain", "on"] },
+    ]);
+  },
+);
+
+it.each([
+  [
+    "a deleted slot copied by a later spread",
+    `const box={ipc:{}};
+     delete box.ipc;
+     const container={ipc:e.ipcMain,...box};
+     delete container.ipc.on;`,
+  ],
+  [
+    "a possibly deleted slot copied by a later spread",
+    `const slot=unknownKey;
+     const box={ipc:{}};
+     delete box[slot];
+     const container={ipc:e.ipcMain,...box};
+     delete container.ipc.on;`,
+  ],
+  [
+    "a nested write through an unknown parent key",
+    `const slot=process.platform;
+     const box={a:{ipc:e.ipcMain},b:{}};
+     box[slot].ipc={};
+     delete box.a.ipc.on;`,
+  ],
+])("preserves possible earlier origins after %s", (_name, writes) => {
+  const values = inspectedValues(`
+    const e=require("electron");
+    ${writes}
+    inspect(e.ipcMain.on);
+    inspect(e.ipcMain.handle);
+  `);
+  expect(values).toEqual([
+    expect.objectContaining({ kind: "unknown" }),
+    { kind: "external", path: ["electron", "ipcMain", "handle"] },
+  ]);
+});
+
+it.each([
+  ["replacement after the copy", "{ipc:e.ipcMain}", "box.ipc={};", "unknown"],
+  ["fill after the copy", "{}", "box.ipc=e.ipcMain;", "external"],
+])("captures spread origins before a %s", (_name, initial, later, kind) => {
+  const values = inspectedValues(`
+    const e=require("electron");
+    const box=${initial};
+    const copy={...box};
+    ${later}
+    delete copy.ipc.on;
+    inspect(e.ipcMain.on);
+    inspect(e.ipcMain.handle);
+  `);
+  expect(values).toEqual([
+    kind === "unknown"
+      ? expect.objectContaining({ kind: "unknown" })
+      : { kind: "external", path: ["electron", "ipcMain", "on"] },
+    { kind: "external", path: ["electron", "ipcMain", "handle"] },
+  ]);
+});
+
+it.each([
+  ["member", "const ipc=box.ipc;", "{}", "e.ipcMain", "external"],
+  ["member", "const ipc=box.ipc;", "e.ipcMain", "{}", "unknown"],
+  ["destructuring", "const {ipc}=box;", "{}", "e.ipcMain", "external"],
+  ["destructuring", "const {ipc}=box;", "e.ipcMain", "{}", "unknown"],
+])(
+  "preserves a %s capture of %s before replacing %s with %s",
+  (_name, capture, initial, replacement, kind) => {
+    const values = inspectedValues(`
+      const e=require("electron");
+      const box={ipc:${initial}};
+      ${capture}
+      box.ipc=${replacement};
+      delete ipc.on;
+      inspect(e.ipcMain.on);
+      inspect(e.ipcMain.handle);
+    `);
+    expect(values).toEqual([
+      kind === "unknown"
+        ? expect.objectContaining({ kind: "unknown" })
+        : { kind: "external", path: ["electron", "ipcMain", "on"] },
+      { kind: "external", path: ["electron", "ipcMain", "handle"] },
+    ]);
+  },
+);
+
+it.each([
+  ["a direct object alias", `const part={}; const captured=part;`],
+  [
+    "a captured member object",
+    `const part={}; const box={part}; const captured=box.part;`,
+  ],
+])("keeps later internal writes visible through %s", (_name, capture) => {
+  const values = inspectedValues(`
+    const e=require("electron");
+    ${capture}
+    part.ipc=e.ipcMain;
+    delete captured.ipc.on;
+    inspect(e.ipcMain.on);
+    inspect(e.ipcMain.handle);
+  `);
+  expect(values).toEqual([
+    expect.objectContaining({ kind: "unknown" }),
+    { kind: "external", path: ["electron", "ipcMain", "handle"] },
+  ]);
 });

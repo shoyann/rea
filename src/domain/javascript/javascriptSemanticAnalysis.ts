@@ -50,6 +50,7 @@ import { collectJavaScriptDerivedSemanticsSteps } from "./javascriptSemanticDeri
 import { evaluateSemanticProvenance } from "./javascriptSemanticValues.js";
 import {
   collectJavaScriptIdentityWritesSteps,
+  type JavaScriptIntrinsicMutation,
   electronExportPath,
   electronMemberPath,
   ELECTRON_MODULE,
@@ -387,9 +388,14 @@ export function* classifyParsedJavaScriptElectronBindingsSteps(
 
 /** Shared lexical identity and visible-write proof for direct and wrapped calls. */
 export interface JavaScriptElectronIdentity {
+  readonly mutations: readonly JavaScriptIntrinsicMutation[];
   readonly bindings: ReadonlyMap<number, readonly string[]>;
   readonly intactExport: (path: readonly (string | null)[]) => boolean;
   readonly exportPath: (root: t.Node) => readonly string[] | undefined;
+  readonly enrichWritesSteps: (
+    symbolicOrigin: (target: t.Node) => readonly (readonly (string | null)[])[],
+  ) => Generator<void>;
+  readonly invalidateAll: () => void;
 }
 
 export function* indexJavaScriptElectronIdentitySteps(
@@ -397,6 +403,7 @@ export function* indexJavaScriptElectronIdentitySteps(
   state: JavaScriptSemanticAnalysisState,
 ): Generator<void, JavaScriptElectronIdentity> {
   const facts = new Map<number, readonly string[]>();
+  const mutations: JavaScriptIntrinsicMutation[] = [];
   const interop = createSemanticModuleInterop(state);
   const writes = new SemanticPropertyPathCoverage();
   let collectedWrites = false;
@@ -426,48 +433,88 @@ export function* indexJavaScriptElectronIdentitySteps(
       ? electronExportPath(origin.importedPath)
       : undefined;
   };
-  yield* collectJavaScriptIdentityWritesSteps(
-    program,
-    (root, kind) => {
-      if (kind === "opaque-call") return interop.opaqueMutationPath(root);
-      const exported = kind === "binding" ? undefined : rootExport(root);
-      return exported === undefined
-        ? (interop.intrinsicPath(root) ??
-            (kind === "member"
-              ? interop.boundIntrinsic(root)?.path
-              : undefined))
-        : ["electron", ...exported];
-    },
-    interop.intrinsicInvocation,
-    interop.staticString,
-    interop.isFreshObject,
-    (node, path) => {
-      if (path[0] === "electron") writes.retain(path);
-      else interop.retainWrite(node, path);
-    },
-  );
+  function* collectWritesSteps(
+    symbolicOrigin?: (
+      target: t.Node,
+    ) => readonly (readonly (string | null)[])[],
+  ): Generator<void> {
+    yield* collectJavaScriptIdentityWritesSteps(
+      program,
+      (target, kind) => {
+        if (kind === "opaque-call") {
+          const scope = interop.opaqueMutationPath(target);
+          return scope === undefined ? [] : [scope];
+        }
+        const { root, members } = electronMemberPath(target);
+        const exported = kind === "binding" ? undefined : rootExport(root);
+        const path =
+          exported === undefined
+            ? (interop.intrinsicPath(root) ??
+              (kind === "member"
+                ? interop.boundIntrinsic(root)?.path
+                : undefined))
+            : ["electron", ...exported];
+        return path !== undefined
+          ? [[...path, ...members]]
+          : kind === "member"
+            ? (symbolicOrigin?.(target) ?? [])
+            : [];
+      },
+      interop.intrinsicInvocation,
+      interop.staticString,
+      interop.isFreshObject,
+      (node, path) => {
+        if (path[0] === "electron") writes.retain(path);
+        else interop.retainWrite(node, path);
+      },
+      collectedWrites ? undefined : (mutation) => mutations.push(mutation),
+    );
+  }
+  yield* collectWritesSteps();
   collectedWrites = true;
   const intactExport = (path: readonly (string | null)[]): boolean =>
     ELECTRON_MODULE.test(path[0] ?? "") &&
     !writes.covers(["electron", ...path.slice(1)]);
+  const candidates: Array<{
+    readonly root: t.Node;
+    readonly members: readonly (string | null)[];
+  }> = [];
   yield* traverseJavaScriptAstSteps(program, {
     enter: (node) => {
       if (
-        !t.isCallExpression(node) &&
-        !t.isOptionalCallExpression(node) &&
-        !t.isNewExpression(node)
+        t.isCallExpression(node) ||
+        t.isOptionalCallExpression(node) ||
+        t.isNewExpression(node)
       )
-        return;
-      const { root, members } = electronMemberPath(node.callee);
+        candidates.push(electronMemberPath(node.callee));
+    },
+  });
+  const refreshBindings = (): void => {
+    facts.clear();
+    for (const { root, members } of candidates) {
       const exported = rootExport(root);
       if (
         exported !== undefined &&
         intactExport(["electron", ...exported, ...members])
       )
         facts.set(root.start ?? -1, exported);
+    }
+  };
+  refreshBindings();
+  return {
+    mutations,
+    bindings: facts,
+    intactExport,
+    exportPath: rootExport,
+    enrichWritesSteps: function* (symbolicOrigin) {
+      yield* collectWritesSteps(symbolicOrigin);
+      refreshBindings();
     },
-  });
-  return { bindings: facts, intactExport, exportPath: rootExport };
+    invalidateAll: () => {
+      writes.retain(["electron"]);
+      facts.clear();
+    },
+  };
 }
 
 // Read import and require origins directly; general value evaluation is

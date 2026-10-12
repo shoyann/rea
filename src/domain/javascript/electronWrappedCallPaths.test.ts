@@ -521,6 +521,170 @@ it("does not trust helper names or follow returns after a definite throw", () =>
   }
 });
 
+describe("wrapped Electron mutation identity", () => {
+  it.each([
+    "const ipc = e.ipcMain; delete ipc.on;",
+    "const ipc = e.ipcMain; ipc.on++;",
+    'require("electron").ipcMain = replacement;',
+    "({ on: e.ipcMain.on } = replacement);",
+    "for (e.ipcMain.on of replacements) {}",
+    'Object.defineProperty(e.ipcMain, "on", { value: replacement });',
+  ])(
+    "does not restore a visibly overwritten IPC method through a wrapper: %s",
+    (write) => {
+      const result = analyzeJavaScriptStaticSource(`
+      const e = require("electron");
+      ${write}
+      function register(channel, handler) { e.ipcMain.on(channel, handler); }
+      register("overwritten:channel", event => event.sender.copy());
+    `);
+      expect(result.electron.ipc).toEqual([]);
+      expect(result.electron.call_paths ?? []).toEqual([]);
+    },
+  );
+  it("keeps untouched IPC methods available when a sibling method is overwritten", () => {
+    const result = analyzeJavaScriptStaticSource(`
+      const e = require("electron");
+      delete require("electron").ipcMain.on;
+      function listen(channel, handler) { e.ipcMain.on(channel, handler); }
+      function handle(channel, handler) { e.ipcMain.handle(channel, handler); }
+      listen("overwritten:channel", event => event.sender.copy());
+      handle("untouched:channel", event => event.sender.copy());
+    `);
+    expect(
+      result.electron.ipc.filter(({ channel }) => channel !== null),
+    ).toMatchObject([{ channel: "untouched:channel", operation: "handle" }]);
+    expect(result.electron.call_paths).toMatchObject([
+      { channel: "untouched:channel", terminal: "ipc-event.sender.copy" },
+    ]);
+  });
+});
+
+describe("symbolic Electron mutation origins", () => {
+  it.each([
+    [
+      "factory",
+      (body: string) =>
+        `function getElectron(){return require("electron");} const e=getElectron(); ${body}`,
+    ],
+    ["module table", (body: string) => bundle(`const e=load(2); ${body}`)],
+    [
+      "module entry point",
+      (body: string) => `const e=require("electron/main"); ${body}`,
+    ],
+  ] as const)(
+    "invalidates an aliased method from a %s without losing its sibling",
+    (_name, source) => {
+      const result = analyzeJavaScriptStaticSource(
+        source(`
+      const ipc=e.ipcMain;
+      delete ipc.on;
+      function listen(channel,handler){e.ipcMain.on(channel,handler);}
+      function handle(channel,handler){e.ipcMain.handle(channel,handler);}
+      listen("overwritten:channel",event=>event.sender.copy());
+      handle("untouched:channel",event=>event.sender.copy());
+    `),
+      );
+      expect(
+        result.electron.ipc.filter(({ channel }) => channel !== null),
+      ).toMatchObject([{ channel: "untouched:channel", operation: "handle" }]);
+      expect(result.electron.call_paths).toMatchObject([
+        { channel: "untouched:channel", terminal: "ipc-event.sender.copy" },
+      ]);
+    },
+  );
+
+  it("invalidates Electron members reached through a returned container", () => {
+    const result = analyzeJavaScriptStaticSource(`
+      function getApis(){return {ipc:require("electron").ipcMain};}
+      const apis=getApis(), copy=apis;
+      delete copy.ipc.on;
+      function register(channel,handler){apis.ipc.on(channel,handler);}
+      register("overwritten:channel",event=>event.sender.copy());
+    `);
+    expect(result.electron.ipc).toEqual([]);
+    expect(result.electron.call_paths ?? []).toEqual([]);
+  });
+
+  it("shares container writes with direct Electron identity readers", () => {
+    const result = analyzeJavaScriptStaticSource(`
+      const ipc=require("electron").ipcMain;
+      const container={ipc};
+      delete container.ipc.on;
+      function register(channel,handler){ipc.on(channel,handler);}
+      register("overwritten:channel",event=>event.sender.copy());
+    `);
+    expect(result.electron.ipc).toEqual([]);
+    expect(result.electron.call_paths ?? []).toEqual([]);
+  });
+
+  it.each([
+    'function pick(){return flag ? require("electron").ipcMain : require("electron").ipcRenderer;}',
+    'function pick(){return flag ? require("electron").ipcMain : unknownApi;}',
+  ])(
+    "retains possible conditional write targets without losing siblings: %s",
+    (factory) => {
+      const result = analyzeJavaScriptStaticSource(`
+      ${factory}
+      const selected=pick();
+      delete selected.on;
+      const e=require("electron");
+      function register(channel,handler){e.ipcMain.on(channel,handler);}
+      function handle(channel,handler){e.ipcMain.handle(channel,handler);}
+      register("overwritten:channel",event=>event.sender.copy());
+      handle("untouched:channel",event=>event.sender.copy());
+    `);
+      expect(
+        result.electron.ipc.filter(({ channel }) => channel !== null),
+      ).toMatchObject([{ channel: "untouched:channel", operation: "handle" }]);
+      expect(result.electron.call_paths).toMatchObject([
+        { channel: "untouched:channel", terminal: "ipc-event.sender.copy" },
+      ]);
+    },
+  );
+
+  it.each([
+    "const container={ipc};",
+    "function collect(...apis){return apis;} const container=collect(ipc);",
+  ])(
+    "covers dynamic container selections while preserving sibling methods: %s",
+    (container) => {
+      const result = analyzeJavaScriptStaticSource(`
+      const ipc=require("electron").ipcMain;
+      ${container}
+      delete container[key].on;
+      function register(channel,handler){ipc.on(channel,handler);}
+      function handle(channel,handler){ipc.handle(channel,handler);}
+      register("overwritten:channel",event=>event.sender.copy());
+      handle("untouched:channel",event=>event.sender.copy());
+    `);
+      expect(result.electron.ipc).toMatchObject([
+        { channel: null, operation: "handle" },
+        { channel: "untouched:channel", operation: "handle" },
+      ]);
+      expect(result.electron.call_paths).toMatchObject([
+        { channel: "untouched:channel", terminal: "ipc-event.sender.copy" },
+      ]);
+    },
+  );
+
+  it("discovers successive writes without reusing pre-mutation values", () => {
+    const result = analyzeJavaScriptStaticSource(`
+      function getElectron(){return require("electron");}
+      const e=getElectron();
+      const ipc=e.ipcMain;
+      delete ipc.on;
+      delete ipc.handle;
+      function listen(channel,handler){e.ipcMain.on(channel,handler);}
+      function handle(channel,handler){e.ipcMain.handle(channel,handler);}
+      listen("overwritten:listen",event=>event.sender.copy());
+      handle("overwritten:handle",event=>event.sender.copy());
+    `);
+    expect(result.electron.ipc).toEqual([]);
+    expect(result.electron.call_paths ?? []).toEqual([]);
+  });
+});
+
 describe("wrapped Electron API identity", () => {
   it("does not restore rejected Electron identities through wrapper substitution", () => {
     for (const source of [
@@ -549,4 +713,581 @@ describe("wrapped Electron API identity", () => {
       expect.objectContaining({ channel: "good", operation: "invoke" }),
     );
   });
+});
+
+describe("Electron container mutation targets", () => {
+  it.each([
+    "delete box.ipc;",
+    "box.ipc = replacement;",
+    "Reflect.set(box, 'ipc', replacement);",
+    "Object.defineProperty(box, 'ipc', { value: replacement });",
+  ])("preserves the module when replacing a container slot: %s", (write) => {
+    const { electron } = analyzeJavaScriptStaticSource(`
+      const e=require("electron");
+      const box={ipc:e.ipcMain};
+      ${write}
+      e.ipcMain.on("direct:untouched",event=>event.sender.copy());
+      function register(channel,handler){e.ipcMain.on(channel,handler);}
+      register("wrapped:untouched",event=>event.sender.copy());
+    `);
+    expect(
+      electron.ipc.filter(({ channel }) => channel !== null),
+    ).toMatchObject([
+      { channel: "direct:untouched", operation: "on" },
+      { channel: "wrapped:untouched", operation: "on" },
+    ]);
+    expect(electron.call_paths).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          channel: "wrapped:untouched",
+          terminal: "ipc-event.sender.copy",
+        }),
+      ]),
+    );
+  });
+
+  it.each([
+    "delete box.ipc.on;",
+    "box.ipc.on = replacement;",
+    "Object.assign(box.ipc, { on: replacement });",
+    "Object.defineProperty(box.ipc, 'on', { value: replacement });",
+    "Reflect.set(box.ipc, 'on', replacement);",
+  ])(
+    "invalidates members written through the container receiver: %s",
+    (write) => {
+      const { electron } = analyzeJavaScriptStaticSource(`
+      const e=require("electron");
+      const box={ipc:e.ipcMain};
+      ${write}
+      e.ipcMain.on("direct:overwritten",event=>event.sender.copy());
+      function register(channel,handler){e.ipcMain.on(channel,handler);}
+      register("wrapped:overwritten",event=>event.sender.copy());
+    `);
+      expect(electron.ipc).toEqual([]);
+      expect(electron.call_paths ?? []).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['import { ipcMain } from "electron";', "ipcMain"],
+    ['import electron from "electron";', "electron.ipcMain"],
+  ])(
+    "retains imported origins inside container writes: %s",
+    (declaration, ipc) => {
+      const { electron } = analyzeJavaScriptStaticSource(`
+      ${declaration}
+      const box={ipc:${ipc}};
+      delete box.ipc.on;
+      ${ipc}.on("direct:overwritten",event=>event.sender.copy());
+      ${ipc}.handle("direct:untouched",event=>event.sender.copy());
+      const e=require("electron");
+      function register(channel,handler){e.ipcMain.on(channel,handler);}
+      register("wrapped:overwritten",event=>event.sender.copy());
+    `);
+      expect(electron.ipc).toMatchObject([
+        { channel: "direct:untouched", operation: "handle" },
+      ]);
+      expect(
+        (electron.call_paths ?? []).some(
+          ({ channel }) => channel === "wrapped:overwritten",
+        ),
+      ).toBe(false);
+    },
+  );
+});
+
+describe("Electron containers populated after initialization", () => {
+  it.each([
+    ["direct slot", "box.ipc=e.ipcMain;", "box.ipc"],
+    ["earlier alias", "const alias=box; box.ipc=e.ipcMain;", "alias.ipc"],
+    ["dynamic slot", "box[slot]=e.ipcMain;", "box[slot]"],
+    ["logical fill", "box.ipc ||= e.ipcMain;", "box.ipc"],
+  ])("invalidates an API reached through a %s", (_name, fill, receiver) => {
+    const { electron } = analyzeJavaScriptStaticSource(`
+      const e=require("electron"); const box={};
+      ${fill}
+      delete ${receiver}.on;
+      e.ipcMain.on("overwritten",event=>event.sender.copy());
+      e.ipcMain.handle("untouched",event=>event.sender.copy());
+    `);
+    expect(electron.ipc).toMatchObject([
+      { channel: "untouched", operation: "handle" },
+    ]);
+  });
+
+  it.each([
+    ["a later fill", "", "box.ipc=e.ipcMain;"],
+    ["a definite replacement", "box.ipc=e.ipcMain; box.ipc={};", ""],
+    ["a definite deletion", "box.ipc=e.ipcMain; delete box.ipc;", ""],
+    ["a compound assignment", "box.ipc+=e.ipcMain;", ""],
+    ["an uncalled writer", "function fill(){box.ipc=e.ipcMain;}", ""],
+  ])("does not infer a mutation from %s", (_name, before, after) => {
+    const { electron } = analyzeJavaScriptStaticSource(`
+      const e=require("electron"); const box={};
+      ${before}
+      delete box.ipc.on;
+      ${after}
+      e.ipcMain.on("untouched",event=>event.sender.copy());
+    `);
+    expect(electron.ipc).toMatchObject([
+      { channel: "untouched", operation: "on" },
+    ]);
+  });
+});
+
+describe("Electron container assignment completion order", () => {
+  it.each([
+    ["box.ipc=(box.ipc=e.ipcMain,{});", false],
+    ["box.ipc=(box.ipc={},e.ipcMain);", true],
+  ] as const)("uses the final committed slot value: %s", (write, mutated) => {
+    const { electron } = analyzeJavaScriptStaticSource(`
+      const e=require("electron"); const box={};
+      ${write}
+      delete box.ipc.on;
+      e.ipcMain.on("selected",event=>event.sender.copy());
+      e.ipcMain.handle("untouched",event=>event.sender.copy());
+    `);
+    expect(electron.ipc.map(({ channel }) => channel)).toEqual(
+      mutated ? ["untouched"] : ["selected", "untouched"],
+    );
+  });
+});
+
+const mutationReceiverCases = [
+  [
+    "Reflect.set replacement",
+    "{ipc:e.ipcMain}",
+    "Reflect.set(box,'ipc',{}); delete box.ipc.on;",
+    false,
+  ],
+  [
+    "Reflect.set insertion",
+    "{ipc:{}}",
+    "Reflect.set(box,'ipc',e.ipcMain); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "Object.assign replacement",
+    "{ipc:e.ipcMain}",
+    "Object.assign(box,{ipc:{}}); delete box.ipc.on;",
+    false,
+  ],
+  [
+    "Reflect.defineProperty replacement",
+    "{ipc:e.ipcMain}",
+    "Reflect.defineProperty(box,'ipc',{value:{}}); delete box.ipc.on;",
+    false,
+  ],
+  [
+    "Object.defineProperties replacement",
+    "{ipc:e.ipcMain}",
+    "Object.defineProperties(box,{ipc:{value:{}}}); delete box.ipc.on;",
+    false,
+  ],
+  [
+    "aliased intrinsic",
+    "{ipc:e.ipcMain}",
+    "const set=Reflect.set; set(box,'ipc',{}); delete box.ipc.on;",
+    false,
+  ],
+  [
+    "explicit receiver",
+    "{ipc:e.ipcMain}",
+    "const other={}; Reflect.set(box,'ipc',{},other); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "conditional replacement",
+    "{ipc:e.ipcMain}",
+    "if(flag) Reflect.set(box,'ipc',{}); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "mutator target captured before later arguments",
+    "{inner:{ipc:{}}}",
+    "Reflect.set(box.inner,'ipc',(box.inner={ipc:{}},e.ipcMain)); delete box.inner.ipc.on;",
+    false,
+  ],
+  [
+    "replacement in a key",
+    "{ipc:e.ipcMain}",
+    "delete box[(box.ipc={},'ipc')].on;",
+    false,
+  ],
+  [
+    "insertion in a key",
+    "{ipc:{}}",
+    "delete box[(box.ipc=e.ipcMain,'ipc')].on;",
+    true,
+  ],
+  [
+    "nested key replacement",
+    "{inner:{ipc:e.ipcMain}}",
+    "delete box.inner[(box.inner.ipc={},'ipc')].on;",
+    false,
+  ],
+  [
+    "retained receiver object",
+    "{inner:{ipc:e.ipcMain}}",
+    "delete box.inner[(box.inner={ipc:{}},'ipc')].on;",
+    true,
+  ],
+  [
+    "intrinsic key effect",
+    "{ipc:e.ipcMain}",
+    "delete box[(Reflect.set(box,'ipc',{}),'ipc')].on;",
+    false,
+  ],
+  [
+    "unknown selected populated child",
+    "{slot:{}}",
+    "box.slot.ipc=e.ipcMain; delete box[process.platform].ipc.on;",
+    true,
+  ],
+  [
+    "assign source alias",
+    "{ipc:{}}",
+    "const source={ipc:e.ipcMain}; Object.assign(box,source); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "assign spread source",
+    "{ipc:{}}",
+    "Object.assign(box,{...{ipc:e.ipcMain}}); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "bound assign source at invocation",
+    "{ipc:{}}",
+    "const source={}; const assign=Object.assign.bind(null,box,source); source.ipc=e.ipcMain; assign(); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "captured computed member",
+    "{ipc:{}}",
+    "const selected=box[(box.ipc=e.ipcMain,'ipc')]; delete selected.on;",
+    true,
+  ],
+  [
+    "truthy logical OR skip",
+    "{ipc:{}}",
+    "box.ipc ||= e.ipcMain; box.ipc.on=()=>{};",
+    false,
+  ],
+  [
+    "non-nullish logical skip",
+    "{ipc:{}}",
+    "box.ipc ??= e.ipcMain; box.ipc.on=()=>{};",
+    false,
+  ],
+  [
+    "falsy logical AND skip",
+    "{ipc:0}",
+    "box.ipc &&= e.ipcMain; if(box.ipc) box.ipc.on=()=>{};",
+    false,
+  ],
+  [
+    "logical OR execution",
+    "{ipc:null}",
+    "box.ipc ||= e.ipcMain; box.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "logical nullish execution",
+    "{ipc:null}",
+    "box.ipc ??= e.ipcMain; box.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "logical AND execution",
+    "{ipc:{}}",
+    "box.ipc &&= e.ipcMain; box.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "logical assignment return",
+    "{ipc:{}}",
+    "const selected=(box.ipc ||= e.ipcMain); delete selected.on;",
+    false,
+  ],
+  [
+    "unresolved logical guard",
+    "{ipc:flag?{}:null}",
+    "box.ipc ||= e.ipcMain; box.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "failed Reflect deletion",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:e.ipcMain}); Reflect.deleteProperty(box,'ipc'); box.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "successful Reflect deletion",
+    "{ipc:e.ipcMain}",
+    "Reflect.deleteProperty(box,'ipc'); delete box.ipc?.on;",
+    false,
+  ],
+  [
+    "failed Reflect set",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:e.ipcMain}); Reflect.set(box,'ipc',{}); box.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "possibly present non-writable descriptor",
+    "{}",
+    "if(true) Object.defineProperty(box,'ipc',{value:e.ipcMain}); Reflect.set(box,'ipc',{}); box.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "failed Reflect descriptor replacement",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:e.ipcMain}); Reflect.defineProperty(box,'ipc',{value:{}}); box.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "assign returned literal",
+    "{}",
+    "const filled=Object.assign({}, {ipc:e.ipcMain}); filled.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "assign returned alias",
+    "{}",
+    "const filled=Object.assign(box, {ipc:e.ipcMain}); filled.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "defineProperty returned literal",
+    "{}",
+    "const filled=Object.defineProperty({},'ipc',{value:e.ipcMain}); filled.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "defineProperties returned literal",
+    "{}",
+    "const filled=Object.defineProperties({},{ipc:{value:e.ipcMain}}); filled.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "setPrototypeOf returned target",
+    "{}",
+    "const filled=Object.setPrototypeOf({ipc:e.ipcMain},null); filled.ipc.on=()=>{};",
+    true,
+  ],
+  [
+    "Reflect boolean return",
+    "{ipc:{}}",
+    "const result=Reflect.set(box,'ipc',e.ipcMain); if(result) result.on=()=>{};",
+    false,
+  ],
+  [
+    "throwing assign into read-only ordinary slot",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:{}}); try { Object.assign(box,{ipc:e.ipcMain}); } catch {} delete box.ipc.on;",
+    false,
+  ],
+  [
+    "throwing assign preserves read-only Electron slot",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:e.ipcMain}); try { Object.assign(box,{ipc:{}}); } catch {} delete box.ipc.on;",
+    true,
+  ],
+  [
+    "throwing Object descriptor replacement",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:{}}); try { Object.defineProperty(box,'ipc',{value:e.ipcMain}); } catch {} delete box.ipc.on;",
+    false,
+  ],
+  [
+    "throwing Object descriptors replacement",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:{}}); try { Object.defineProperties(box,{ipc:{value:e.ipcMain}}); } catch {} delete box.ipc.on;",
+    false,
+  ],
+  [
+    "resolved call receiver replacement",
+    "{ipc:e.ipcMain}",
+    "const get=()=>box; get().ipc={}; delete box.ipc.on;",
+    false,
+  ],
+  [
+    "resolved call receiver insertion",
+    "{ipc:{}}",
+    "const get=()=>box; get().ipc=e.ipcMain; delete box.ipc.on;",
+    true,
+  ],
+  [
+    "resolved nested call receiver replacement",
+    "{inner:{ipc:e.ipcMain}}",
+    "const get=()=>box.inner; get().ipc={}; delete box.inner.ipc.on;",
+    false,
+  ],
+  [
+    "resolved intrinsic call receiver replacement",
+    "{ipc:e.ipcMain}",
+    "const get=()=>box; Object.assign(get(),{ipc:{}}); delete box.ipc.on;",
+    false,
+  ],
+  [
+    "writable non-configurable descriptor replacement",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:e.ipcMain,writable:true}); Reflect.defineProperty(box,'ipc',{value:{}}); delete box.ipc.on;",
+    false,
+  ],
+  [
+    "writable non-configurable descriptor insertion",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:{},writable:true}); Reflect.defineProperty(box,'ipc',{value:e.ipcMain}); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "non-configurable descriptor rejects reconfiguration",
+    "{}",
+    "Object.defineProperty(box,'ipc',{value:e.ipcMain,writable:true}); Reflect.defineProperty(box,'ipc',{value:{},configurable:true}); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "assign omits non-enumerable property",
+    "{ipc:{}}",
+    "const source={}; Object.defineProperty(source,'ipc',{value:e.ipcMain}); Object.assign(box,source); delete box.ipc.on;",
+    false,
+  ],
+  [
+    "assign copies enumerable property",
+    "{ipc:{}}",
+    "const source={}; Object.defineProperty(source,'ipc',{value:e.ipcMain,enumerable:true}); Object.assign(box,source); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "assign preserves uncertain enumerability",
+    "{ipc:{}}",
+    "const source={}; Object.defineProperty(source,'ipc',{value:e.ipcMain,enumerable:flag}); Object.assign(box,source); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "spread omits non-enumerable property",
+    "{ipc:{}}",
+    "const source={}; Object.defineProperty(source,'ipc',{value:e.ipcMain}); const copied={...box,...source}; delete copied.ipc.on;",
+    false,
+  ],
+  [
+    "assign observes updated enumerability",
+    "{ipc:{}}",
+    "const source={}; Object.defineProperty(source,'ipc',{value:e.ipcMain,configurable:true}); Object.defineProperty(source,'ipc',{enumerable:true}); Object.assign(box,source); delete box.ipc.on;",
+    true,
+  ],
+  [
+    "assign return omits non-enumerable property",
+    "{ipc:{}}",
+    "const source={}; Object.defineProperty(source,'ipc',{value:e.ipcMain}); const filled=Object.assign(box,source); delete filled.ipc.on;",
+    false,
+  ],
+  [
+    "assign stops at an earlier failed property",
+    "{ipc:{}}",
+    "Object.defineProperty(box,'blocked',{value:{}}); try { Object.assign(box,{blocked:{},ipc:e.ipcMain}); } catch {} delete box.ipc.on;",
+    false,
+  ],
+  [
+    "assign preserves a property written before failure",
+    "{ipc:{}}",
+    "Object.defineProperty(box,'blocked',{value:{}}); try { Object.assign(box,{ipc:e.ipcMain,blocked:{}}); } catch {} delete box.ipc.on;",
+    true,
+  ],
+  [
+    "fresh call results retain separate identities",
+    "{}",
+    "const make=()=>({ipc:{}}); const first=make(); make().ipc=e.ipcMain; delete first.ipc.on;",
+    false,
+  ],
+  [
+    "descriptor updates preserve other enumerable source properties",
+    "{}",
+    "const source={ipc:e.ipcMain}; Object.defineProperty(source,'hidden',{value:0}); Object.assign(box,source); const key='ipc'; delete box[key].on;",
+    true,
+  ],
+] as const;
+
+describe("Electron mutation receiver execution order", () => {
+  it.each(mutationReceiverCases)(
+    "follows the selected object's state for %s",
+    (_name, initial, mutation, mutated) => {
+      const { electron } = analyzeJavaScriptStaticSource(`
+        const e=require("electron"); const box=${initial};
+        ${mutation}
+        e.ipcMain.on("direct:selected",event=>event.sender.copy());
+        function register(channel,handler){e.ipcMain.on(channel,handler);}
+        register("wrapped:selected",event=>event.sender.copy());
+        e.ipcMain.handle("untouched",event=>event.sender.copy());
+      `);
+      const selected = mutated
+        ? ["untouched"]
+        : ["direct:selected", "wrapped:selected", "untouched"];
+      expect(
+        electron.ipc
+          .filter(({ channel }) => channel !== null)
+          .map(({ channel }) => channel)
+          .sort(),
+      ).toEqual([...selected].sort());
+      expect(
+        (electron.call_paths ?? []).map(({ channel }) => channel).sort(),
+      ).toEqual([...selected].sort());
+    },
+  );
+});
+
+describe("Electron mutations through captured nested objects", () => {
+  it.each([
+    [
+      "member alias",
+      "const alias=box.inner;",
+      "box.inner.ipc=e.ipcMain;",
+      "alias.ipc",
+      true,
+    ],
+    [
+      "reverse member alias",
+      "const alias=box.inner;",
+      "alias.ipc=e.ipcMain;",
+      "box.inner.ipc",
+      true,
+    ],
+    [
+      "destructured object",
+      "const {inner}=box;",
+      "box.inner.ipc=e.ipcMain;",
+      "inner.ipc",
+      true,
+    ],
+    [
+      "stored object",
+      "const saved={inner:box.inner};",
+      "box.inner.ipc=e.ipcMain;",
+      "saved.inner.ipc",
+      true,
+    ],
+    [
+      "replaced parent slot",
+      "const alias=box.inner;",
+      "box.inner={}; box.inner.ipc=e.ipcMain;",
+      "alias.ipc",
+      false,
+    ],
+  ] as const)(
+    "preserves the captured object's identity: %s",
+    (_name, capture, write, receiver, mutated) => {
+      const { electron } = analyzeJavaScriptStaticSource(`
+      const e=require("electron"); const box={inner:{ipc:{}}};
+      ${capture} ${write}
+      delete ${receiver}.on;
+      e.ipcMain.on("selected",event=>event.sender.copy());
+      e.ipcMain.handle("untouched",event=>event.sender.copy());
+    `);
+      expect(electron.ipc.map(({ channel }) => channel)).toEqual(
+        mutated ? ["untouched"] : ["selected", "untouched"],
+      );
+    },
+  );
 });

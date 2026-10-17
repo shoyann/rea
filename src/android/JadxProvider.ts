@@ -68,6 +68,12 @@ const waitForTurn = (
     });
   });
 
+const operationTimeoutGuidance = (operation: string, timeoutMs: number) => ({
+  userMessage: `JADX operation ${operation} did not finish within REA_JADX_OPERATION_TIMEOUT_MS (${String(timeoutMs)} ms).`,
+  remediationAction:
+    "For a known slow APK load, raise REA_JADX_OPERATION_TIMEOUT_MS in the environment that starts REA, then restart REA and retry. If using MCP, also raise the client tool-call timeout. The bridge startup and upstream decompilation limits remain separate.",
+});
+
 const executionError = (context: {
   cause: unknown;
   request: AndroidRequest;
@@ -83,6 +89,7 @@ const executionError = (context: {
       ? undefined
       : timeout.aborted && cancellation.reason === timeout.reason
         ? new AnalysisTimeoutError(request.operation, timeoutMs, {
+            ...operationTimeoutGuidance(request.operation, timeoutMs),
             cause: cancellation.reason,
           })
         : new AnalysisCancelledError(request.operation, {
@@ -127,7 +134,11 @@ const executionError = (context: {
   if (signal?.aborted === true)
     return new AnalysisCancelledError(request.operation, { cause });
   if (timeout.aborted)
-    return new AnalysisTimeoutError(request.operation, timeoutMs);
+    return new AnalysisTimeoutError(
+      request.operation,
+      timeoutMs,
+      operationTimeoutGuidance(request.operation, timeoutMs),
+    );
   const protocolFailure = session?.transport.failureReason();
   if (protocolFailure !== undefined && protocolFailure !== null)
     return new AnalysisOutputError(request.operation, protocolFailure, {

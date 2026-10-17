@@ -170,6 +170,59 @@ it("cancels Android admission while hashing the selected APK", async () => {
   }
 });
 
+it("retains timeout guidance and cause when the deadline expires during hash descriptor close", async () => {
+  const { apk, launches, provider } = await setup(
+    "normal",
+    undefined,
+    undefined,
+    { REA_JADX_OPERATION_TIMEOUT_MS: "1500" },
+  );
+  const target = await parseBinaryTarget(apk);
+  if (!target.ok) throw target.error;
+  const owners: OwnedFileHandle[] = [];
+  const originalClose = OwnedFileHandle.prototype.close;
+  const close = vi
+    .spyOn(OwnedFileHandle.prototype, "close")
+    .mockImplementationOnce(async function (this: OwnedFileHandle) {
+      owners.push(this);
+      // Keep the real descriptor owned until after the selected deadline.
+      await new Promise((resolve) => setTimeout(resolve, 1600));
+      await originalClose.call(this);
+    });
+  try {
+    const result = await provider.execute(target.value, {
+      operation: "inspect_android_package",
+      input: { path: apk },
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "AnalysisTimeoutError",
+        timeoutMs: 1500,
+        cause: { name: "TimeoutError" },
+      },
+    });
+    if (result.ok) throw new Error("Expected Android admission timeout");
+    expect(projectAnalysisError(result.error)).toMatchObject({
+      code: "provider_timeout",
+      message: expect.stringContaining(
+        "REA_JADX_OPERATION_TIMEOUT_MS (1500 ms)",
+      ),
+      remediation: {
+        action: expect.stringContaining("REA_JADX_OPERATION_TIMEOUT_MS"),
+      },
+      details: { timeout_ms: 1500 },
+    });
+    expect(owners).toHaveLength(1);
+    expect(owners[0]?.handle.fd).toBe(-1);
+    expect(launches).toHaveLength(0);
+  } finally {
+    close.mockRestore();
+    await provider.close();
+    await verifyCleanup(launches);
+  }
+});
+
 it("preserves cancellation cause when hashing succeeded but descriptor close failed", async () => {
   const { apk, launches, provider } = await setup();
   const target = await parseBinaryTarget(apk);
@@ -661,16 +714,26 @@ it("cancels active and queued requests, cleans ownership and never launches a qu
     { signal: queuedController.signal },
   );
   queuedController.abort();
-  expect(await queued).toMatchObject({
+  const queuedOutcome = await queued;
+  expect(queuedOutcome).toMatchObject({
     ok: false,
     error: { _tag: "AnalysisCancelledError" },
   });
   expect(launches).toHaveLength(1);
   activeController.abort();
-  expect(await active).toMatchObject({
+  const activeOutcome = await active;
+  expect(activeOutcome).toMatchObject({
     ok: false,
     error: { _tag: "AnalysisCancelledError" },
   });
+  for (const outcome of [queuedOutcome, activeOutcome]) {
+    if (outcome.ok) throw new Error("Expected caller cancellation");
+    const projected = projectAnalysisError(outcome.error);
+    expect(projected.code).toBe("cancelled");
+    expect(projected.remediation.action).not.toContain(
+      "REA_JADX_OPERATION_TIMEOUT_MS",
+    );
+  }
   await provider.close();
   await verifyCleanup(launches);
 });
@@ -702,10 +765,19 @@ it("ends each queued stalled operation at the caller-selected deadline and clean
       },
     });
     if (outcome.ok) throw new Error("Expected the selected deadline");
-    expect(projectAnalysisError(outcome.error)).toMatchObject({
+    const projected = projectAnalysisError(outcome.error);
+    expect(projected).toMatchObject({
       code: "provider_timeout",
+      message: expect.stringContaining(
+        "REA_JADX_OPERATION_TIMEOUT_MS (1500 ms)",
+      ),
+      remediation: {
+        action: expect.stringContaining("REA_JADX_OPERATION_TIMEOUT_MS"),
+      },
       details: { timeout_ms: 1500 },
     });
+    expect(projected.remediation.action).toContain("restart REA");
+    expect(projected.remediation.action).toContain("client tool-call timeout");
   }
   expect(launches).toHaveLength(2);
   // The deadline path itself releases ownership before provider shutdown.

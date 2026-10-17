@@ -318,8 +318,11 @@ export REA_JADX_OPERATION_TIMEOUT_MS=600000
 
 The value must be a decimal millisecond count from 1 to 2147483647; anything
 else is refused before Java starts. The same deadline bounds each upstream
-call, a timeout reports the selected value, and a passing JADX configuration
-check in `rea doctor` reports the effective `operation_timeout_ms`. Explicit
+call, and a whole-operation timeout names `REA_JADX_OPERATION_TIMEOUT_MS` and
+the selected value.
+For a known slow APK load, raise this setting in the environment that starts REA,
+then restart REA and retry. A passing JADX configuration check in `rea doctor`
+reports the effective `operation_timeout_ms`. Explicit
 cancellation still ends the operation immediately, and partial observations
 and owned-process cleanup are unchanged. Raising the deadline does not extend
 the bridge's 30-second startup handshake or the upstream **90-second**
